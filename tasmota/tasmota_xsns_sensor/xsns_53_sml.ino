@@ -1115,6 +1115,9 @@ void sml_dump_start(char c) {
 
 #define SML_EBUS_SKIP_SYNC_DUMPS
 
+#ifdef USE_SML_MBUS
+void mbus_process_byte(uint32_t meters, uint8_t iob);
+#endif
 
 void dump2log(void) {
   int16_t index = 0, hcnt = 0;
@@ -1295,6 +1298,35 @@ void dump2log(void) {
       	}
 				}
 				break;
+#ifdef USE_SML_MBUS
+      case 'b':
+        // M-Bus: dump received bytes AND feed them through the frame state machine
+        {
+          uint32_t d_lastms = millis();
+          sml_dump_start(' ');
+          while ((millis() - d_lastms) < 40) {
+            while (SML_SAVAILABLE) {
+              d_lastms = millis();
+              uint8_t c = SML_SREAD;
+              yield();
+              sprintf_P(&sml_globs.log_data[sml_globs.sml_logindex], PSTR("%02x "), c);
+              if (sml_globs.sml_logindex < sml_globs.logsize - 7) {
+                sml_globs.sml_logindex += 3;
+              }
+              if (sml_globs.sml_logindex >= 32*3+2) {
+                AddLogData(LOG_LEVEL_INFO, sml_globs.log_data);
+                sml_dump_start(' ');
+              }
+              mbus_process_byte(meter, c);
+            }
+          }
+          if (sml_globs.sml_logindex > 2) {
+            sml_globs.log_data[sml_globs.sml_logindex] = 0;
+            AddLogData(LOG_LEVEL_INFO, sml_globs.log_data);
+          }
+        }
+        break;
+#endif  // USE_SML_MBUS
  #ifdef USE_SML_CANBUS       
       case 'C':
  #ifdef ESP8266     
@@ -3009,6 +3041,11 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
         return;
       }
       break;
+    case 'b':
+#ifdef USE_SML_MBUS
+      mbus_process_byte(meters, iob);
+#endif  // USE_SML_MBUS
+      break;
   }
   sb_counter++;
   if (sb_counter > 10) {
@@ -3879,7 +3916,7 @@ void SML_Decode(uint8_t index) {
         } else {
           double dval;
           char type = sml_globs.mp[mindex].type;
-          if (type != 'C' && type != 'e' && type != 'r' && type != 'R' && type != 'm' && type != 'M' && type != 'k' && type != 'p' && type != 'v') {
+          if (type != 'C' && type != 'e' && type != 'r' && type != 'R' && type != 'm' && type != 'M' && type != 'k' && type != 'p' && type != 'v' && type != 'b') {
             // get numeric values
             if (type == 'o' || type == 'c') {
               if (*mp == '(') {
@@ -3951,9 +3988,34 @@ void SML_Decode(uint8_t index) {
               // mbus index
               mp++;
               uint8_t mb_index = strtol((char*)mp, (char**)&mp, 10);
+#ifdef USE_SML_MBUS
+              // M-Bus: all records arrive in one frame, skip modbus index check
+              if (sml_globs.mp[mindex].type != 'b')
+#endif
               if (mb_index != sml_globs.mp[mindex].index) {
                 goto nextsect;
               }
+#ifdef USE_SML_MBUS
+              if (sml_globs.mp[mindex].type == 'b') {
+                // M-Bus: read pre-decoded value from records array
+                struct MBUS_DECODE_STATE *ms = meter_desc[mindex].mbus_state;
+                if (ms && mb_index < ms->record_count) {
+                  dval = ms->records[mb_index].value;
+                  if (HighestLogLevel() >= LOG_LEVEL_DEBUG) {
+                    // 64-bit records reach ±9.2e18: 19 digits + sign + '.' + 6 decimals + NUL = 28
+                    char vbuf[32];
+                    dtostrfd(dval, 6, vbuf);
+                    AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: @i%d = %s (VIF=0x%02x, count=%d)"),
+                      mb_index, vbuf, ms->records[mb_index].vif_code, ms->record_count);
+                  }
+                } else {
+                  AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: @i%d out of range (count=%d, ms=%d)"),
+                    mb_index, ms ? ms->record_count : -1, ms ? 1 : 0);
+                  goto nextsect;
+                }
+                mp++;
+              } else
+#endif  // USE_SML_MBUS
               if (sml_globs.mp[mindex].type == 'k') {
                 // crc is already checked, get float value
                 dval = mbus_dval;
@@ -4714,6 +4776,13 @@ void reset_sml_vars(uint16_t maxmeters) {
 #endif // USE_SML_TCP
 #endif // USE_BAT_CTRL
 
+#ifdef USE_SML_MBUS
+    if (mp->mbus_state) {
+      free(mp->mbus_state);
+      mp->mbus_state = NULL;
+    }
+#endif // USE_SML_MBUS
+
   }
 }
 
@@ -5246,6 +5315,12 @@ next_line:
     // set serial and crc buffers 
   for (uint32_t meters = 0; meters < sml_globs.meters_used; meters++ ) {
     struct METER_DESC *mp = &meter_desc[meters];
+#ifdef USE_SML_MBUS
+    // M-Bus frames can be up to 255+6 bytes, enforce minimum buffer
+    if (mp->type == 'b' && mp->sbsiz < 280) {
+      mp->sbsiz = 280;
+    }
+#endif  // USE_SML_MBUS
     if (mp->sbsiz) {
       mp->sbuff = (uint8_t*)calloc(mp->sbsiz, 1);
       // SECURITY: the entire RX path writes mp->sbuff[...] unconditionally; on a
@@ -5425,7 +5500,7 @@ next_line:
 #ifdef ESP8266
 #ifdef SPECIAL_SS
         char type = mp->type;
-        if (type == 'm' || type == 'M' || type == 'k' || type == 'p' || type == 'R' || type == 'v') {
+        if (type == 'm' || type == 'M' || type == 'k' || type == 'p' || type == 'R' || type == 'v' || type == 'b') {
           mp->meter_ss = new TasmotaSerial(mp->srcpin, mp->trxpin, 1, 0, mp->sibsiz);
         } else {
           mp->meter_ss = new TasmotaSerial(mp->srcpin, mp->trxpin, 1, 1, mp->sibsiz);
@@ -5491,7 +5566,7 @@ next_line:
           if (mp->sopt == 2) {
             smode = SERIAL_8N2;
           }
-          if (mp->type=='M') {
+          if (mp->type=='M' || mp->type=='b') {
             smode = SERIAL_8E1;
             if (mp->sopt == 2) {
               smode = SERIAL_8E2;
@@ -5557,10 +5632,31 @@ next_line:
     char type = mp->type;
 
     if (!(mp->so_flags.SO_OBIS_LINE)) {
-      mp->shift_mode = (type != 'e' && type != 'k' && type != 'm' && type != 'M' && type != 'p' && type != 'R' && type != 'v');
+      mp->shift_mode = (type != 'e' && type != 'k' && type != 'm' && type != 'M' && type != 'p' && type != 'R' && type != 'v' && type != 'b');
     } else {
-      mp->shift_mode = (type != 'o' && type != 'e' && type != 'k' && type != 'm' && type != 'M' && type != 'p' && type != 'R' && type != 'v');
+      mp->shift_mode = (type != 'o' && type != 'e' && type != 'k' && type != 'm' && type != 'M' && type != 'p' && type != 'R' && type != 'v' && type != 'b');
     }
+
+#ifdef USE_SML_MBUS
+    if (type == 'b') {
+#ifdef USE_SML_DECRYPT
+      // M-Bus is plaintext; a stray key line would also leave hp NULL on the
+      // reject paths below, hanging the RX loop in sml_shift_in
+      if (mp->use_crypt) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d crypt not supported, key ignored"), meters + 1);
+        mp->use_crypt = false;
+      }
+#endif  // USE_SML_DECRYPT
+      mp->mbus_state = (struct MBUS_DECODE_STATE*)calloc(1, sizeof(struct MBUS_DECODE_STATE));
+      if (mp->mbus_state) {
+        mp->mbus_state->frame_state = MBUS_FS_IDLE;
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d init, sbsiz=%d, max_records=%d, state_size=%d"),
+          meters + 1, mp->sbsiz, MBUS_MAX_RECORDS, sizeof(struct MBUS_DECODE_STATE));
+      } else {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d alloc failed!"), meters + 1);
+      }
+    }
+#endif  // USE_SML_MBUS
 
 #ifdef USE_SML_DECRYPT
 		if (mp->use_crypt) {
@@ -6405,7 +6501,7 @@ void SML_Send_Seq(uint32_t meter, char *seq) {
     Hexdump(sbuff, slen);
 #else
     uint8_t type = sml_globs.mp[(sml_globs.dump2log&7) - 1].type;
-    if (type == 'm' || type == 'M' || type == 'k' || type == 'C') {
+    if (type == 'm' || type == 'M' || type == 'k' || type == 'C' || type == 'b') {
       Hexdump(sbuff, slen);
     }
 #endif

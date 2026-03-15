@@ -126,6 +126,28 @@
 #define USE_SML_TCP_IP_STR
 #endif
 
+// M-Bus (EN 13757) protocol support
+#ifdef USE_SML_MBUS
+#define MBUS_FRAME_LONG_START  0x68
+#define MBUS_FRAME_SHORT_START 0x10
+#define MBUS_FRAME_STOP        0x16
+#define MBUS_FRAME_ACK         0xE5
+
+// frame state machine states
+#define MBUS_FS_IDLE       0
+#define MBUS_FS_LONG_LEN1  1
+#define MBUS_FS_LONG_LEN2  2
+#define MBUS_FS_LONG_START2 3
+#define MBUS_FS_LONG_DATA  4
+#define MBUS_FS_SHORT_CF   5
+#define MBUS_FS_SHORT_ADDR 6
+#define MBUS_FS_SHORT_CS   7
+#define MBUS_FS_SHORT_STOP 8
+
+#ifndef MBUS_MAX_RECORDS
+#define MBUS_MAX_RECORDS 20
+#endif
+#endif  // USE_SML_MBUS
 
 // median filter eliminates outliers, but uses much RAM and CPU cycles
 // 672 bytes extra RAM with SML_MAX_VARS = 16
@@ -551,6 +573,21 @@ struct SML_CRC_DATA {
 };
 #endif // USE_SML_CRC
 
+#ifdef USE_SML_MBUS
+struct MBUS_RECORD {
+  double value;
+  uint8_t vif_code;
+};
+
+struct MBUS_DECODE_STATE {
+  struct MBUS_RECORD records[MBUS_MAX_RECORDS];
+  uint32_t last_byte_ms;
+  uint8_t record_count;
+  uint8_t frame_state;
+  uint8_t expected_len;
+};
+#endif  // USE_SML_MBUS
+
 struct METER_DESC {
   int8_t srcpin;
   uint8_t type;
@@ -644,6 +681,10 @@ struct METER_DESC {
   uint32_t can_masks[SML_CAN_MASKS];
   uint32_t can_filters[SML_CAN_FILTERS];
 #endif // USE_SML_CANBUS
+
+#ifdef USE_SML_MBUS
+  struct MBUS_DECODE_STATE *mbus_state;
+#endif // USE_SML_MBUS
 
 #ifdef ESP32
   int8_t uart_index;
@@ -780,6 +821,58 @@ struct METER_DESC  meter_desc[MAX_METERS];
 #endif // USE_SML_EBUS_ARB
 #endif // USE_SML_EBUS_MASTER
 
+#ifdef USE_SML_MBUS
+// M-Bus VIF (Value Information Field) primary table (EN 13757-3)
+// maps VIF code (lower 7 bits, 0x00-0x7B) to scaling exponent (power of 10)
+const int8_t MBUS_VIF_SCALAR[] PROGMEM = {
+// 0x00-0x07: Energy Wh, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x08-0x0F: Energy J, 10^(nnn)
+  0, 1, 2, 3, 4, 5, 6, 7,
+// 0x10-0x17: Volume m3, 10^(nnn-6)
+  -6, -5, -4, -3, -2, -1, 0, 1,
+// 0x18-0x1F: Mass kg, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x20-0x23: On time (sec/min/hrs/days)
+  0, 0, 0, 0,
+// 0x24-0x27: Operating time (sec/min/hrs/days)
+  0, 0, 0, 0,
+// 0x28-0x2F: Power W, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x30-0x37: Power J/h, 10^(nnn)
+  0, 1, 2, 3, 4, 5, 6, 7,
+// 0x38-0x3F: Volume flow m3/h, 10^(nnn-6)
+  -6, -5, -4, -3, -2, -1, 0, 1,
+// 0x40-0x47: Volume flow m3/min, 10^(nnn-7)
+  -7, -6, -5, -4, -3, -2, -1, 0,
+// 0x48-0x4F: Volume flow m3/s, 10^(nnn-9)
+  -9, -8, -7, -6, -5, -4, -3, -2,
+// 0x50-0x57: Mass flow kg/h, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x58-0x5B: Flow temperature C, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x5C-0x5F: Return temperature C, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x60-0x63: Temperature difference K, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x64-0x67: External temperature C, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x68-0x6B: Pressure bar, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x6C: Date (type G)
+  0,
+// 0x6D: Date/Time (type F)
+  0,
+// 0x6E-0x6F: HCA (dimensionless)
+  0, 0,
+// 0x70-0x73: Averaging duration (sec/min/hrs/days)
+  0, 0, 0, 0,
+// 0x74-0x77: Actuality duration (sec/min/hrs/days)
+  0, 0, 0, 0,
+// 0x78-0x7B: Fabrication number
+  0, 0, 0, 0,
+};
+#endif  // USE_SML_MBUS
 
 // calulate deltas
 #define MAX_DVARS MAX_METERS*2
@@ -2040,6 +2133,431 @@ void Eba_AttachRx(uint32_t meters) {
 }
 #endif // USE_SML_EBUS_ARB
 #endif // USE_SML_EBUS_MASTER
+
+#ifdef USE_SML_MBUS
+// M-Bus checksum: modular sum of bytes
+uint8_t mbus_checksum(const uint8_t *data, uint16_t len) {
+  uint8_t cs = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    cs += data[i];
+  }
+  return cs;
+}
+
+// read N-byte signed integer in either byte order
+static int64_t mbus_read_int(const uint8_t *dp, uint8_t len, bool big_endian) {
+  uint64_t val = 0;
+  if (big_endian) {
+    for (uint8_t i = 0; i < len; i++) val = (val << 8) | dp[i];
+  } else {
+    for (int8_t i = len - 1; i >= 0; i--) val = (val << 8) | dp[i];
+  }
+  // left-align, then arithmetic shift right = sign extension
+  uint8_t shift = 64 - 8 * len;
+  return (int64_t)(val << shift) >> shift;
+}
+
+// read N-byte BCD in either byte order, returns absolute value; sets *negative
+// nibbles 0xA-0xE are invalid per EN 13757-3 (0xF only as sign in MSB): sets *error
+static int64_t mbus_read_bcd(const uint8_t *dp, uint8_t len, bool big_endian, bool *negative, bool *error) {
+  int64_t val = 0;
+  *negative = false;
+  *error = false;
+  for (uint8_t n = 0; n < len; n++) {
+    uint8_t idx = big_endian ? n : (len - 1 - n);
+    uint8_t hi = (dp[idx] >> 4) & 0x0F;
+    uint8_t lo = dp[idx] & 0x0F;
+    if (n == 0 && hi == 0x0F) {
+      *negative = true;
+      if (lo > 9) { *error = true; return 0; }
+      val = val * 10 + lo;
+    } else {
+      if (hi > 9 || lo > 9) { *error = true; return 0; }
+      val = val * 10 + hi;
+      val = val * 10 + lo;
+    }
+  }
+  return val;
+}
+
+// decode DIF/VIF variable data records from M-Bus RSP_UD frame
+// buf points to start of frame in sbuff (after 0x68 L L 0x68)
+// len is the L field value (number of bytes between second 0x68 and checksum)
+void mbus_decode_frame(struct METER_DESC *mp, uint8_t *buf, uint16_t len) {
+  struct MBUS_DECODE_STATE *ms = mp->mbus_state;
+  if (!ms) return;
+
+  ms->record_count = 0;
+
+  // buf[0]=C, buf[1]=A, buf[2]=CI
+  if (len < 3) {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: decode frame too short (%d < 3)"), len);
+    return;
+  }
+
+  uint8_t ci = buf[2];
+  // CI=0x72: variable data structure, CI=0x76: variable data structure (response from secondary)
+  if (ci != 0x72 && ci != 0x76) {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: CI=0x%02x not variable data (expected 0x72/0x76), skip decode"), ci);
+    return;
+  }
+
+  bool mode2 = (ci == 0x76);
+
+  // skip C(1) + A(1) + CI(1) + fixed data header(12) = 15 bytes
+  // fixed header: ID(4) + manufacturer(2) + version(1) + medium(1) + access_nr(1) + status(1) + signature(2)
+  if (len < 15) {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame too short for fixed header (%d < 15)"), len);
+    return;
+  }
+
+  // log fixed header info: meter ID (BCD), medium, status
+  AddLog(LOG_LEVEL_INFO, PSTR("MBS: ID=%02x%02x%02x%02x medium=0x%02x ver=%d status=0x%02x access=%d%s"),
+    mode2 ? buf[3] : buf[6], mode2 ? buf[4] : buf[5],
+    mode2 ? buf[5] : buf[4], mode2 ? buf[6] : buf[3],
+    buf[10], buf[9], buf[12], buf[11],
+    mode2 ? " (Mode 2)" : "");
+
+  uint16_t pos = 15;
+
+  while (pos < len && ms->record_count < MBUS_MAX_RECORDS) {
+    // parse DIF
+    uint8_t dif = buf[pos++];
+    if (dif == 0x0F || dif == 0x1F) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] DIF=0x%02x manufacturer specific, stop"), ms->record_count, dif);
+      break;
+    }
+    if (dif == 0x2F) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: idle filler 0x2F at pos %d, skip"), pos - 1);
+      continue;
+    }
+
+    uint8_t data_coding = dif & 0x0F;
+    uint16_t dif_pos = pos - 1;  // remember DIF position for debug
+    uint8_t func_field = (dif >> 4) & 0x03;   // bits 5-4: 0=inst, 1=max, 2=min, 3=err
+    uint16_t storage_nr = (dif >> 6) & 0x01;  // bit 6: LSB of storage number
+
+    // parse DIFE (DIF extension bytes): carry storage number, tariff, subunit
+    uint8_t tariff = 0;
+    uint8_t subunit = 0;
+    {
+      uint8_t prev = dif;
+      uint8_t dife_idx = 0;
+      while ((prev & 0x80) && pos < len) {
+        prev = buf[pos++];
+        // DIFE: bit 6 = subunit (LSB first), bits 5-4 = tariff, bits 3-0 = storage number
+        if (dife_idx < 3) {  // cap shifts to keep within accumulator widths
+          storage_nr |= (uint16_t)(prev & 0x0F) << (1 + dife_idx * 4);
+          tariff |= ((prev >> 4) & 0x03) << (dife_idx * 2);
+          subunit |= ((prev >> 6) & 0x01) << dife_idx;
+        }
+        dife_idx++;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: DIFE=0x%02x at pos %d (stor=%d tariff=%d sub=%d%s)"),
+          prev, pos - 1, storage_nr, tariff, subunit, (dife_idx > 3) ? " trunc" : "");
+      }
+    }
+
+    // parse VIF
+    if (pos >= len) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: truncated at VIF, pos=%d len=%d"), pos, len);
+      break;
+    }
+    uint8_t vif = buf[pos++];
+    uint8_t vif_code = vif & 0x7F;
+    uint8_t base_vif = vif;
+    int8_t scalar = 0;
+    bool supported_vif = ((base_vif & 0x80) == 0);
+
+    if (supported_vif && vif_code < sizeof(MBUS_VIF_SCALAR)) {
+      scalar = (int8_t)pgm_read_byte(&MBUS_VIF_SCALAR[vif_code]);
+    }
+
+    // skip VIFE (extension bytes)
+    while ((vif & 0x80) && pos < len) {
+      vif = buf[pos++];
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: VIFE=0x%02x at pos %d"), vif, pos - 1);
+    }
+
+    if (!supported_vif) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] unsupported extended VIF 0x%02x"), ms->record_count, base_vif);
+    }
+
+    // determine data length from DIF coding
+    uint8_t data_len = 0;
+    bool supported_record = supported_vif;
+    switch (data_coding) {
+      case 0x00: data_len = 0; break;   // no data
+      case 0x01: data_len = 1; break;   // 8-bit integer
+      case 0x02: data_len = 2; break;   // 16-bit integer
+      case 0x03: data_len = 3; break;   // 24-bit integer
+      case 0x04: data_len = 4; break;   // 32-bit integer
+      case 0x05: data_len = 4; break;   // 32-bit float
+      case 0x06: data_len = 6; break;   // 48-bit integer
+      case 0x07: data_len = 8; break;   // 64-bit integer
+      case 0x08: data_len = 0; break;   // selection for readout
+      case 0x09: data_len = 1; break;   // 2-digit BCD
+      case 0x0A: data_len = 2; break;   // 4-digit BCD
+      case 0x0B: data_len = 3; break;   // 6-digit BCD
+      case 0x0C: data_len = 4; break;   // 8-digit BCD
+      case 0x0D:                         // variable length
+        if (pos < len) {
+          data_len = buf[pos++];         // LVAR byte gives length
+          if (data_len > 0xBF) {
+            // BCD: 0xC0-0xC9 pos / 0xD0-0xD9 neg, binary: 0xE0-0xEF, float: 0xF0+
+            data_len &= 0x0F;
+          }
+        }
+        supported_record = false;
+        break;
+      case 0x0E: data_len = 6; break;   // 12-digit BCD
+      case 0x0F: data_len = 0; break;   // special functions
+    }
+
+    if (pos + data_len > len) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: rec[%d] truncated, need %d bytes at pos %d, have %d"), ms->record_count, data_len, pos, len);
+      break;
+    }
+
+    // decode value
+    double value = 0;
+    uint8_t *dp = &buf[pos];
+
+    // log raw data bytes for this record
+    {
+      char dbuf[8*3+1];
+      uint8_t dlog = data_len > 8 ? 8 : data_len;
+      for (uint8_t i = 0; i < dlog; i++) {
+        sprintf_P(&dbuf[i*3], PSTR("%02x "), dp[i]);
+      }
+      dbuf[dlog*3] = 0;
+      // function field names: inst(antaneous), max, min, err(or)
+      static const char mbus_func_names[] PROGMEM = "inst\0max\0\0min\0\0err\0";
+      char fbuf[5];
+      strcpy_P(fbuf, &mbus_func_names[func_field * 5]);
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] @%d DIF=0x%02x VIF=0x%02x coding=%d dlen=%d func=%s stor=%d tar=%d data: %s"),
+        ms->record_count, dif_pos, dif, vif_code, data_coding, data_len, fbuf, storage_nr, tariff, dbuf);
+    }
+
+    if (!supported_record) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] skipped unsupported coding=%d VIF=0x%02x"),
+        ms->record_count, data_coding, base_vif);
+    } else if (data_coding >= 0x01 && data_coding <= 0x04) {
+      value = (double)mbus_read_int(dp, data_len, mode2);
+    } else if (data_coding == 0x05) {
+      // 32-bit IEEE 754 float
+      union { uint32_t u; float f; } tmp;
+      if (mode2) {
+        tmp.u = ((uint32_t)dp[0] << 24) | ((uint32_t)dp[1] << 16)
+              | ((uint32_t)dp[2] << 8) | dp[3];
+      } else {
+        memcpy(&tmp.f, dp, 4);
+      }
+      value = (double)tmp.f;
+    } else if (data_coding == 0x06) {
+      value = (double)mbus_read_int(dp, 6, mode2);
+    } else if (data_coding == 0x07) {
+      value = (double)mbus_read_int(dp, 8, mode2);
+    } else if (data_coding >= 0x09 && data_coding <= 0x0E) {
+      bool negative, bcd_error;
+      int64_t bcd_val = mbus_read_bcd(dp, data_len, mode2, &negative, &bcd_error);
+      if (bcd_error) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: rec[%d] invalid BCD nibble, skip"), ms->record_count);
+        supported_record = false;
+      } else {
+        value = negative ? -(double)bcd_val : (double)bcd_val;
+      }
+    }
+    // for data_coding 0x00 and 0x08: value stays 0
+
+    pos += data_len;
+
+    if (!supported_record) {
+      // still occupy the index slot so @iN indexes remain stable
+      ms->records[ms->record_count].value = 0;
+      ms->records[ms->record_count].vif_code = vif_code;
+      ms->record_count++;
+      continue;
+    }
+
+    // apply VIF scaling
+    if (scalar != 0) {
+      double mult = 1.0;
+      if (scalar > 0) {
+        for (int8_t i = 0; i < scalar; i++) mult *= 10.0;
+      } else {
+        for (int8_t i = 0; i < -scalar; i++) mult /= 10.0;
+      }
+      value *= mult;
+    }
+
+    ms->records[ms->record_count].value = value;
+    ms->records[ms->record_count].vif_code = vif_code;
+
+    // 64-bit records reach ±9.2e18: 19 digits + sign + '.' + 6 decimals + NUL = 28
+    char vbuf[32];
+    dtostrfd(value, 6, vbuf);
+    AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] value=%s (scalar=%d, VIF=0x%02x, func=%d, stor=%d)"),
+      ms->record_count, vbuf, scalar, vif_code, func_field, storage_nr);
+
+    ms->record_count++;
+  }
+
+  AddLog(LOG_LEVEL_INFO, PSTR("MBS: decode done, %d records extracted"), ms->record_count);
+}
+
+// process one received byte through the M-Bus frame state machine
+void mbus_process_byte(uint32_t meters, uint8_t iob) {
+  struct METER_DESC *mp = &meter_desc[meters];
+  struct MBUS_DECODE_STATE *ms = mp->mbus_state;
+  if (!ms) return;
+
+  // timeout: reset if no byte received for >300ms mid-frame
+  if (ms->frame_state != MBUS_FS_IDLE && ms->last_byte_ms &&
+      (millis() - ms->last_byte_ms > 300)) {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame timeout (%d ms), reset state %d"),
+      (int)(millis() - ms->last_byte_ms), ms->frame_state);
+    ms->frame_state = MBUS_FS_IDLE;
+    mp->spos = 0;
+  }
+  ms->last_byte_ms = millis();
+
+  // single-byte ACK (0xE5), consume silently
+  if (ms->frame_state == MBUS_FS_IDLE && iob == MBUS_FRAME_ACK) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: ACK received (0xE5)"));
+    return;
+  }
+
+  switch (ms->frame_state) {
+    case MBUS_FS_IDLE:
+      if (iob == MBUS_FRAME_LONG_START) {
+        mp->spos = 0;
+        mp->sbuff[mp->spos++] = iob;
+        ms->frame_state = MBUS_FS_LONG_LEN1;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: long frame start detected"));
+      } else if (iob == MBUS_FRAME_SHORT_START) {
+        mp->spos = 0;
+        mp->sbuff[mp->spos++] = iob;
+        ms->frame_state = MBUS_FS_SHORT_CF;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: short frame start detected"));
+      } else {
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: idle, unexpected byte 0x%02x"), iob);
+      }
+      break;
+
+    // long frame: 0x68 L L 0x68 [C A CI ...data] CS 0x16
+    case MBUS_FS_LONG_LEN1:
+      ms->expected_len = iob;
+      mp->sbuff[mp->spos++] = iob;
+      ms->frame_state = MBUS_FS_LONG_LEN2;
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: L1=%d"), iob);
+      break;
+
+    case MBUS_FS_LONG_LEN2:
+      mp->sbuff[mp->spos++] = iob;
+      if (iob != ms->expected_len) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: length mismatch L1=%d L2=%d, reset"), ms->expected_len, iob);
+        ms->frame_state = MBUS_FS_IDLE;
+        mp->spos = 0;
+      } else {
+        ms->frame_state = MBUS_FS_LONG_START2;
+      }
+      break;
+
+    case MBUS_FS_LONG_START2:
+      mp->sbuff[mp->spos++] = iob;
+      if (iob != MBUS_FRAME_LONG_START) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: 2nd start byte missing, got 0x%02x, reset"), iob);
+        ms->frame_state = MBUS_FS_IDLE;
+        mp->spos = 0;
+      } else {
+        ms->frame_state = MBUS_FS_LONG_DATA;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: header ok, expecting %d data bytes"), ms->expected_len);
+      }
+      break;
+
+    case MBUS_FS_LONG_DATA:
+      if (mp->spos < mp->sbsiz) {
+        mp->sbuff[mp->spos++] = iob;
+      }
+      // total frame: 4 (header) + L (user data) + 1 (CS) + 1 (stop) = L + 6
+      if (mp->spos >= (uint16_t)(ms->expected_len + 6)) {
+        uint8_t stop_byte = mp->sbuff[mp->spos - 1];
+        uint8_t recv_cs = mp->sbuff[mp->spos - 2];
+        // checksum covers L bytes starting at position 4 (after second 0x68)
+        uint8_t calc_cs = mbus_checksum(&mp->sbuff[4], ms->expected_len);
+        if (stop_byte == MBUS_FRAME_STOP && recv_cs == calc_cs) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: valid frame, L=%d, C=0x%02x A=0x%02x CI=0x%02x"),
+            ms->expected_len, mp->sbuff[4], mp->sbuff[5], mp->sbuff[6]);
+          mbus_decode_frame(mp, &mp->sbuff[4], ms->expected_len);
+          SML_Decode(meters);
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame INVALID! stop=0x%02x(exp 0x16) CS recv=0x%02x calc=0x%02x, spos=%d"),
+            stop_byte, recv_cs, calc_cs, mp->spos);
+          // hex dump first 32 bytes for debugging
+          char dbuf[32*3+1];
+          uint16_t dlen = mp->spos > 32 ? 32 : mp->spos;
+          for (uint16_t i = 0; i < dlen; i++) {
+            sprintf_P(&dbuf[i*3], PSTR("%02x "), mp->sbuff[i]);
+          }
+          dbuf[dlen*3] = 0;
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame[0..%d]: %s"), dlen - 1, dbuf);
+        }
+        ms->frame_state = MBUS_FS_IDLE;
+        mp->spos = 0;
+      }
+      break;
+
+    // short frame: 0x10 C A CS 0x16
+    case MBUS_FS_SHORT_CF:
+      mp->sbuff[mp->spos++] = iob;
+      ms->frame_state = MBUS_FS_SHORT_ADDR;
+      break;
+
+    case MBUS_FS_SHORT_ADDR:
+      mp->sbuff[mp->spos++] = iob;
+      ms->frame_state = MBUS_FS_SHORT_CS;
+      break;
+
+    case MBUS_FS_SHORT_CS:
+      mp->sbuff[mp->spos++] = iob;
+      // spos is now 4: [0x10, C, A, CS] — stop byte handled in SHORT_STOP
+      {
+        uint8_t calc_cs = (mp->sbuff[1] + mp->sbuff[2]) & 0xFF;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: short frame C=0x%02x A=0x%02x CS=0x%02x(calc 0x%02x)"),
+          mp->sbuff[1], mp->sbuff[2], mp->sbuff[3], calc_cs);
+        if (calc_cs != mp->sbuff[3]) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: short frame CS mismatch recv=0x%02x calc=0x%02x"),
+            mp->sbuff[3], calc_cs);
+          ms->frame_state = MBUS_FS_IDLE;
+          mp->spos = 0;
+          break;
+        }
+      }
+      ms->frame_state = MBUS_FS_SHORT_STOP;
+      break;
+
+    case MBUS_FS_SHORT_STOP:
+      if (iob != MBUS_FRAME_STOP) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: short frame missing stop byte, got 0x%02x"), iob);
+      }
+      ms->frame_state = MBUS_FS_IDLE;
+      mp->spos = 0;
+      break;
+
+    default:
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: unknown state %d, reset"), ms->frame_state);
+      ms->frame_state = MBUS_FS_IDLE;
+      mp->spos = 0;
+      break;
+  }
+
+  if (mp->spos >= mp->sbsiz) {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: buffer overflow at spos=%d (sbsiz=%d), reset"), mp->spos, mp->sbsiz);
+    ms->frame_state = MBUS_FS_IDLE;
+    mp->spos = 0;
+  }
+}
+#endif  // USE_SML_MBUS
 
 void sml_shift_in(uint32_t meters, uint32_t shard) {
   uint32_t count;

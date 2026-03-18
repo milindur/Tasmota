@@ -872,6 +872,60 @@ const int8_t MBUS_VIF_SCALAR[] PROGMEM = {
 // 0x78-0x7B: Fabrication number
   0, 0, 0, 0,
 };
+
+// Extended VIF 0xFD scaling table (codes 0x40-0x5F, index = vif_code - 0x40)
+const int8_t MBUS_VIFE_FD_SCALAR[] PROGMEM = {
+// 0x40-0x4F: Voltage V, 10^(nnnn-9)
+  -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6,
+// 0x50-0x5F: Current A, 10^(nnnn-12)
+  -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3,
+};
+
+// Extended VIF 0xFB scaling table (codes 0x00-0x77)
+const int8_t MBUS_VIFE_FB_SCALAR[] PROGMEM = {
+// 0x00-0x01: Energy MWh, 10^(n-1)
+  -1, 0,
+// 0x02-0x03: Energy GJ, 10^(n-1)
+  -1, 0,
+// 0x04-0x07: (reserved)
+  0, 0, 0, 0,
+// 0x08-0x0F: Reactive energy kVARh, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x10-0x11: Volume m3, 10^(n+2)
+  2, 3,
+// 0x12-0x17: (reserved)
+  0, 0, 0, 0, 0, 0,
+// 0x18-0x19: Mass ton, 10^(n+2)
+  2, 3,
+// 0x1A-0x2B: (reserved)
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+// 0x2C-0x2D: Power MW, 10^(n-1)
+  -1, 0,
+// 0x2E-0x2F: Energy flow GJ/h, 10^(n-1)
+  -1, 0,
+// 0x30-0x37: Reactive power kVAR, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x38-0x3F: Apparent energy kVAh, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x40-0x47: Apparent power kVA, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x48-0x4F: Frequency Hz, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x50-0x57: Phase angle deg, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+// 0x58-0x5B: Flow temperature F, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x5C-0x5F: Return temperature F, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x60-0x63: Temperature difference F, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x64-0x67: External temperature F, 10^(nn-3)
+  -3, -2, -1, 0,
+// 0x68-0x6F: (reserved)
+  0, 0, 0, 0, 0, 0, 0, 0,
+// 0x70-0x77: Cumulative max power W, 10^(nnn-3)
+  -3, -2, -1, 0, 1, 2, 3, 4,
+};
 #endif  // USE_SML_MBUS
 
 // calulate deltas
@@ -2196,29 +2250,38 @@ void mbus_decode_frame(struct METER_DESC *mp, uint8_t *buf, uint16_t len) {
   }
 
   uint8_t ci = buf[2];
-  // CI=0x72: variable data structure, CI=0x76: variable data structure (response from secondary)
-  if (ci != 0x72 && ci != 0x76) {
-    AddLog(LOG_LEVEL_INFO, PSTR("MBS: CI=0x%02x not variable data (expected 0x72/0x76), skip decode"), ci);
-    return;
-  }
+  uint16_t pos;
 
   bool mode2 = (ci == 0x76);
 
-  // skip C(1) + A(1) + CI(1) + fixed data header(12) = 15 bytes
-  // fixed header: ID(4) + manufacturer(2) + version(1) + medium(1) + access_nr(1) + status(1) + signature(2)
-  if (len < 15) {
-    AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame too short for fixed header (%d < 15)"), len);
+  if (ci == 0x72 || ci == 0x76) {
+    // variable data structure, 12-byte header
+    if (len < 15) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame too short for full header (%d < 15)"), len);
+      return;
+    }
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: ID=%02x%02x%02x%02x medium=0x%02x ver=%d status=0x%02x access=%d%s"),
+      mode2 ? buf[3] : buf[6], mode2 ? buf[4] : buf[5],
+      mode2 ? buf[5] : buf[4], mode2 ? buf[6] : buf[3],
+      buf[10], buf[9], buf[12], buf[11],
+      mode2 ? " (Mode 2)" : "");
+    pos = 15;  // C(1)+A(1)+CI(1)+header(12)
+  } else if (ci == 0x7A) {
+    // variable data structure, 4-byte short header (access_nr, status, signature x2)
+    if (len < 7) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame too short for short header (%d < 7)"), len);
+      return;
+    }
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: CI=0x7A short header, access=%d status=0x%02x"), buf[3], buf[4]);
+    pos = 7;  // C(1)+A(1)+CI(1)+header(4)
+  } else if (ci == 0x78) {
+    // variable data structure, no header
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: CI=0x78 no header"));
+    pos = 3;  // C(1)+A(1)+CI(1)
+  } else {
+    AddLog(LOG_LEVEL_INFO, PSTR("MBS: CI=0x%02x unsupported, skip decode"), ci);
     return;
   }
-
-  // log fixed header info: meter ID (BCD), medium, status
-  AddLog(LOG_LEVEL_INFO, PSTR("MBS: ID=%02x%02x%02x%02x medium=0x%02x ver=%d status=0x%02x access=%d%s"),
-    mode2 ? buf[3] : buf[6], mode2 ? buf[4] : buf[5],
-    mode2 ? buf[5] : buf[4], mode2 ? buf[6] : buf[3],
-    buf[10], buf[9], buf[12], buf[11],
-    mode2 ? " (Mode 2)" : "");
-
-  uint16_t pos = 15;
 
   while (pos < len && ms->record_count < MBUS_MAX_RECORDS) {
     // parse DIF
@@ -2266,20 +2329,62 @@ void mbus_decode_frame(struct METER_DESC *mp, uint8_t *buf, uint16_t len) {
     uint8_t vif_code = vif & 0x7F;
     uint8_t base_vif = vif;
     int8_t scalar = 0;
-    bool supported_vif = ((base_vif & 0x80) == 0);
+    bool supported_vif = true;
 
-    if (supported_vif && vif_code < sizeof(MBUS_VIF_SCALAR)) {
+    if (base_vif == 0xFD || base_vif == 0xFB) {
+      // extended VIF: first VIFE byte is the effective code
+      if (pos < len) {
+        vif = buf[pos++];
+        vif_code = vif & 0x7F;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: ext VIF 0x%02x, VIFE=0x%02x"), base_vif, vif_code);
+        // skip any further chained VIFE bytes
+        while ((vif & 0x80) && pos < len) {
+          vif = buf[pos++];
+        }
+      }
+      // table lookup for scaling
+      if (base_vif == 0xFD) {
+        if (vif_code >= 0x40 && vif_code < 0x40 + sizeof(MBUS_VIFE_FD_SCALAR)) {
+          scalar = (int8_t)pgm_read_byte(&MBUS_VIFE_FD_SCALAR[vif_code - 0x40]);
+        }
+      } else {  // 0xFB
+        if (vif_code < sizeof(MBUS_VIFE_FB_SCALAR)) {
+          scalar = (int8_t)pgm_read_byte(&MBUS_VIFE_FB_SCALAR[vif_code]);
+        }
+      }
+    } else if (vif_code >= 0x7C) {
+      // special VIF codes
+      supported_vif = false;
+      if (vif_code == 0x7C) {
+        // 0x7C/0xFC: plain-text VIF — VIFE chain (if extension bit), then length byte + ASCII string
+        while ((vif & 0x80) && pos < len) {
+          vif = buf[pos++];
+        }
+        if (pos >= len) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: rec[%d] truncated in plain-text VIF at pos %d"), ms->record_count, pos);
+          break;
+        }
+        uint8_t text_len = buf[pos++];
+        if (pos + text_len > len) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: rec[%d] plain-text VIF %d chars exceeds len at pos %d"), ms->record_count, text_len, pos);
+          break;
+        }
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] plain-text VIF, %d chars"), ms->record_count, text_len);
+        pos += text_len;
+      } else {
+        // 0x7E/0xFE any VIF, 0x7F/0xFF mfr specific
+        while ((vif & 0x80) && pos < len) {
+          vif = buf[pos++];
+        }
+      }
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] unsupported VIF 0x%02x"), ms->record_count, base_vif);
+    } else if (vif_code < sizeof(MBUS_VIF_SCALAR)) {
+      // primary VIF table (0x00-0x7B, with or without extension bit)
       scalar = (int8_t)pgm_read_byte(&MBUS_VIF_SCALAR[vif_code]);
-    }
-
-    // skip VIFE (extension bytes)
-    while ((vif & 0x80) && pos < len) {
-      vif = buf[pos++];
-      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: VIFE=0x%02x at pos %d"), vif, pos - 1);
-    }
-
-    if (!supported_vif) {
-      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: rec[%d] unsupported extended VIF 0x%02x"), ms->record_count, base_vif);
+      // consume combinable VIFE bytes if extension bit set
+      while ((base_vif & 0x80) && (vif & 0x80) && pos < len) {
+        vif = buf[pos++];
+      }
     }
 
     // determine data length from DIF coding

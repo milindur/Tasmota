@@ -132,6 +132,10 @@
 #define MBUS_FRAME_SHORT_START 0x10
 #define MBUS_FRAME_STOP        0x16
 #define MBUS_FRAME_ACK         0xE5
+#define MBUS_C_SND_NKE         0x40
+#define MBUS_C_REQ_UD2         0x5B
+#define MBUS_C_RSP_UD          0x08
+#define MBUS_C_RSP_MASK        0x4F  // keep PRM + function code, mask ACD/DFC status bits
 
 // frame state machine states
 #define MBUS_FS_IDLE       0
@@ -143,6 +147,29 @@
 #define MBUS_FS_SHORT_ADDR 6
 #define MBUS_FS_SHORT_CS   7
 #define MBUS_FS_SHORT_STOP 8
+
+// protocol-level state machine (above frame-level parsing)
+#define MBUS_PS_IDLE       0
+#define MBUS_PS_WAKEUP     1
+#define MBUS_PS_WAIT_WAKE  2
+#define MBUS_PS_NKE        3
+#define MBUS_PS_WAIT_ACK   4
+#define MBUS_PS_REQUEST    5
+#define MBUS_PS_READING    6
+
+#define MBUS_WAKEUP_BYTES        550   // EN 13757-2 min ~528 (2.2s @2400 8N1), +22 margin
+#define MBUS_WAKEUP_BYTE         0x55
+#define MBUS_TX_BUF_SIZE         (MBUS_WAKEUP_BYTES + 64)  // TX buffer to queue full wakeup without blocking
+#define MBUS_MAX_NKE_RETRY       3
+#ifdef ESP32
+#define MBUS_WAIT_WAKE_TICKS     (((MBUS_WAKEUP_BYTES * 10 * 1000 / 2400) + 99) / 100 + 4)  // wire time (rounded up) + 400ms settling (write only queues)
+#else
+#define MBUS_WAIT_WAKE_TICKS     4    // 400ms settling only, blocking write already covered wire time
+#endif
+#define MBUS_WAIT_ACK_TICKS      3    // 300ms ACK timeout
+#define MBUS_READ_TIMEOUT_TICKS  40   // 4s response timeout
+#define MBUS_DEFAULT_ADDR        0xFE // broadcast
+#define MBUS_BOOT_DELAY_TICKS    50   // 5s initial delay after boot
 
 #ifndef MBUS_MAX_RECORDS
 #define MBUS_MAX_RECORDS 20
@@ -277,9 +304,18 @@ public:
   int peek(void);
   int read(void) override;
   size_t write(uint8_t byte) override;
+  // buffer write must reach HardwareSerial as ONE call: the default
+  // Print::write loops per byte, and each byte then costs a separate
+  // UART TX-ring item (8-byte header + padding) — a 550-byte M-Bus wakeup
+  // would overflow the ring and block despite a large enough TX buffer
+  size_t write(const uint8_t *buffer, size_t size) override {
+    if (hws) { return hws->write(buffer, size); }
+    return 0;
+  }
   int available(void) override;
   void flush(void) override;
   void setRxBufferSize(uint32_t size);
+  size_t setTxBufferSize(size_t size) { if (hws) { return hws->setTxBufferSize(size); } return 0; }
   void updateBaudRate(uint32_t baud);
   void rxRead(void);
   void end();
@@ -319,6 +355,11 @@ void sml_callRxRead(void *self) { ((SML_ESP32_SERIAL*)self)->rxRead(); };
 SML_ESP32_SERIAL::SML_ESP32_SERIAL(uint32_t index) {
   uart_index = index;
   m_valid = true;
+  // end()/dtor and the reuse check in begin() dereference these before begin()
+  hws = nullptr;
+  m_buffer = nullptr;
+  m_rx_pin = -1;
+  m_tx_pin = -1;
 }
 
 SML_ESP32_SERIAL::~SML_ESP32_SERIAL(void) {
@@ -326,7 +367,9 @@ SML_ESP32_SERIAL::~SML_ESP32_SERIAL(void) {
     hws->end();
 		delete(hws);
   } else {
-    detachInterrupt(m_rx_pin);
+    if (m_rx_pin >= 0) {
+      detachInterrupt(m_rx_pin);
+    }
     if (m_buffer) {
       free(m_buffer);
     }
@@ -342,8 +385,16 @@ void SML_ESP32_SERIAL::setbaud(uint32_t speed) {
 }
 
 void SML_ESP32_SERIAL::end(void) {
+  if (hws) {
+    // stop the UART driver, otherwise the core rejects a following
+    // setTxBufferSize()/setRxBufferSize() ("can't be resized when running")
+    hws->end();
+  } else if (m_rx_pin >= 0) {
+    detachInterrupt(m_rx_pin);
+  }
   if (m_buffer) {
     free(m_buffer);
+    m_buffer = nullptr;
   }
 }
 
@@ -366,22 +417,30 @@ void SML_ESP32_SERIAL::rx_intr_enable(void) {
 bool SML_ESP32_SERIAL::begin(uint32_t speed, uint32_t smode, int32_t recpin, int32_t trxpin, int32_t invert) {
   if (!m_valid) { return false; }
 
-  m_buffer = 0;
   if (recpin < 0) {
     setbaud(speed);
+    // re-begin: detach the old ISR before touching the ring it writes into
+    if (!hws && m_rx_pin >= 0) { detachInterrupt(m_rx_pin); }
     m_rx_pin = -recpin;
     serial_buffer_size = ESP32_SWS_BUFFER_SIZE;
+    if (m_buffer) { free(m_buffer); m_buffer = nullptr; }
     m_buffer = (uint8_t*)malloc(serial_buffer_size);
     if (m_buffer == NULL) return false;
     pinMode(m_rx_pin, INPUT_PULLUP);
-    attachInterruptArg(m_rx_pin, sml_callRxRead, this, CHANGE);
     m_in_pos = m_out_pos = 0;
+    attachInterruptArg(m_rx_pin, sml_callRxRead, this, CHANGE);
     hws = nullptr;
   } else {
     cfgmode = smode;
     m_rx_pin = recpin;
     m_tx_pin = trxpin;
-    hws = new HardwareSerial(uart_index);
+    if (!hws) {
+      hws = new HardwareSerial(uart_index);
+    } else {
+      // re-begin (M-Bus parity switch): reuse the object, a new one per
+      // call leaks ~2 HardwareSerial + UART driver installs per poll cycle
+      hws->end();
+    }
     if (hws) {
       hws->begin(speed, cfgmode, m_rx_pin, m_tx_pin, invert);
     }
@@ -585,6 +644,14 @@ struct MBUS_DECODE_STATE {
   uint8_t record_count;
   uint8_t frame_state;
   uint8_t expected_len;
+  // protocol state machine
+  uint8_t proto_state;      // MBUS_PS_*
+  uint8_t proto_tick;       // tick counter within current state
+  uint8_t retry_count;      // NKE retry counter
+  uint16_t poll_countdown;  // 100ms ticks until next poll
+  uint8_t got_ack;          // set by mbus_process_byte on ACK
+  uint8_t frame_done;       // set after successful frame decode
+  uint8_t addr;             // M-Bus primary address
 };
 #endif  // USE_SML_MBUS
 
@@ -595,7 +662,7 @@ struct METER_DESC {
   int32_t params;
   char prefix[SML_PREFIX_SIZE];
   int8_t trxpin;
-  uint8_t tsecs;
+  uint16_t tsecs;
   char *txmem;
   uint8_t index;
   uint8_t max_index;
@@ -946,7 +1013,7 @@ int8_t index;
 
 struct SML_GLOBS {
   uint8_t sml_send_blocks;
-  uint8_t sml_100ms_cnt;
+  uint16_t sml_100ms_cnt;
   uint8_t sml_desc_cnt;
   uint8_t meters_used;
   uint8_t maxvars;
@@ -2542,6 +2609,85 @@ void mbus_decode_frame(struct METER_DESC *mp, uint8_t *buf, uint16_t len) {
   AddLog(LOG_LEVEL_INFO, PSTR("MBS: decode done, %d records extracted"), ms->record_count);
 }
 
+void mbus_write_bytes(uint32_t meter, const uint8_t *data, uint16_t data_len) {
+  struct METER_DESC *mp = &meter_desc[meter];
+  if (!mp->meter_ss) return;
+
+  if (mp->trx_en.trxen) {
+    digitalWrite(mp->trx_en.trxenpin, mp->trx_en.trxenpol ^ 1);
+  }
+  mp->meter_ss->flush();
+  mp->meter_ss->write(data, data_len);
+  if (mp->trx_en.trxen) {
+    mp->meter_ss->flush();
+    digitalWrite(mp->trx_en.trxenpin, mp->trx_en.trxenpol);
+  }
+}
+
+// send the 550-byte wakeup sequence; caller (MBUS_PS_WAKEUP) has verified
+// meter_ss and just re-begun the serial 8N1, so the TX path starts out empty
+void mbus_send_wakeup(uint32_t meter) {
+  struct METER_DESC *mp = &meter_desc[meter];
+#ifdef ESP32
+  // queue the whole sequence as ONE write: it fits the MBUS_TX_BUF_SIZE
+  // TX ring as a single item and returns immediately, the UART drains it in
+  // wire time (~2.3s @ 2400 Bd) while the main loop keeps running —
+  // flush()ing per chunk would busy-spin that whole time. A TX-enable pin
+  // stays keyed until MBUS_PS_WAIT_WAKE expires (wire time has passed then).
+  if (mp->trx_en.trxen) {
+    digitalWrite(mp->trx_en.trxenpin, mp->trx_en.trxenpol ^ 1);
+  }
+  uint8_t wbuf[MBUS_WAKEUP_BYTES];
+  memset(wbuf, MBUS_WAKEUP_BYTE, sizeof(wbuf));
+  mp->meter_ss->write(wbuf, sizeof(wbuf));
+#else
+  // ESP8266: blocking per-chunk writes (small stack buffer) cover the wire
+  // time here, MBUS_WAIT_WAKE_TICKS then only adds the settling pause
+  uint8_t wbuf[64];
+  memset(wbuf, MBUS_WAKEUP_BYTE, sizeof(wbuf));
+  uint16_t remaining = MBUS_WAKEUP_BYTES;
+  while (remaining) {
+    uint16_t chunk = (remaining > sizeof(wbuf)) ? sizeof(wbuf) : remaining;
+    mbus_write_bytes(meter, wbuf, chunk);
+    remaining -= chunk;
+  }
+#endif
+}
+
+// switch serial config for M-Bus meter
+void mbus_switch_serial(uint32_t meter, uint32_t smode) {
+  struct METER_DESC *mp = &meter_desc[meter];
+  if (!mp->meter_ss) return;
+#ifdef ESP8266
+  if (mp->meter_ss->hardwareSerial()) {
+    mp->meter_ss->begin(mp->params, smode);
+    // begin() resets U0C0, re-apply the invert bits as in the init path
+    if (mp->so_flags.SO_TRX_INVERT) {
+      U0C0 = U0C0 | BIT(UCRXI) | BIT(UCTXI); // Inverse RX, TX
+    }
+  }
+#else
+  mp->meter_ss->begin(mp->params, smode, mp->srcpin, mp->trxpin,
+                       mp->so_flags.SO_TRX_INVERT);
+  if (mp->so_flags.SO_DISS_PULL) {
+    gpio_pullup_dis((gpio_num_t)mp->srcpin);
+  }
+#endif
+}
+
+// build and send M-Bus short frame: 0x10 <C> <addr> <cs> 0x16
+void mbus_send_short_frame(uint32_t meter, uint8_t c_field, uint8_t addr) {
+  struct METER_DESC *mp = &meter_desc[meter];
+  if (!mp->meter_ss) return;
+  uint8_t frame[5];
+  frame[0] = MBUS_FRAME_SHORT_START;
+  frame[1] = c_field;
+  frame[2] = addr;
+  frame[3] = (c_field + addr) & 0xFF;
+  frame[4] = MBUS_FRAME_STOP;
+  mbus_write_bytes(meter, frame, sizeof(frame));
+}
+
 // process one received byte through the M-Bus frame state machine
 void mbus_process_byte(uint32_t meters, uint8_t iob) {
   struct METER_DESC *mp = &meter_desc[meters];
@@ -2561,6 +2707,7 @@ void mbus_process_byte(uint32_t meters, uint8_t iob) {
   // single-byte ACK (0xE5), consume silently
   if (ms->frame_state == MBUS_FS_IDLE && iob == MBUS_FRAME_ACK) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: ACK received (0xE5)"));
+    ms->got_ack = 1;
     return;
   }
 
@@ -2623,10 +2770,21 @@ void mbus_process_byte(uint32_t meters, uint8_t iob) {
         // checksum covers L bytes starting at position 4 (after second 0x68)
         uint8_t calc_cs = mbus_checksum(&mp->sbuff[4], ms->expected_len);
         if (stop_byte == MBUS_FRAME_STOP && recv_cs == calc_cs) {
-          AddLog(LOG_LEVEL_INFO, PSTR("MBS: valid frame, L=%d, C=0x%02x A=0x%02x CI=0x%02x"),
-            ms->expected_len, mp->sbuff[4], mp->sbuff[5], mp->sbuff[6]);
-          mbus_decode_frame(mp, &mp->sbuff[4], ms->expected_len);
-          SML_Decode(meters);
+          uint8_t c_field = mp->sbuff[4];
+          uint8_t a_field = mp->sbuff[5];
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame CS ok, L=%d, C=0x%02x A=0x%02x CI=0x%02x"),
+            ms->expected_len, c_field, a_field, mp->sbuff[6]);
+          // accept only RSP_UD (ACD/DFC status bits masked) from the polled
+          // address; with broadcast 0xFE any responder address is valid
+          if ((c_field & MBUS_C_RSP_MASK) != MBUS_C_RSP_UD ||
+              (ms->addr != MBUS_DEFAULT_ADDR && a_field != ms->addr)) {
+            AddLog(LOG_LEVEL_INFO, PSTR("MBS: discard frame C=0x%02x A=0x%02x, expected RSP_UD from 0x%02X"),
+              c_field, a_field, ms->addr);
+          } else {
+            mbus_decode_frame(mp, &mp->sbuff[4], ms->expected_len);
+            SML_Decode(meters);
+            ms->frame_done = 1;
+          }
         } else {
           AddLog(LOG_LEVEL_INFO, PSTR("MBS: frame INVALID! stop=0x%02x(exp 0x16) CS recv=0x%02x calc=0x%02x, spos=%d"),
             stop_byte, recv_cs, calc_cs, mp->spos);
@@ -5566,7 +5724,7 @@ next_line:
           if (mp->sopt == 2) {
             smode = SERIAL_8N2;
           }
-          if (mp->type=='M' || mp->type=='b') {
+          if (mp->type=='M' || (mp->type=='b' && mp->tsecs == 0)) {
             smode = SERIAL_8E1;
             if (mp->sopt == 2) {
               smode = SERIAL_8E2;
@@ -5656,6 +5814,7 @@ next_line:
         AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d M-Bus requires hardware serial on ESP8266"), meters + 1);
         continue;
       }
+      AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d note: wakeup write blocks ~2.3s per poll on ESP8266"), meters + 1);
 #endif  // ESP8266
 #if defined(ESP32) && defined(USE_ESP32_SW_SERIAL)
       if (mp->srcpin < 0) {
@@ -5666,8 +5825,37 @@ next_line:
       mp->mbus_state = (struct MBUS_DECODE_STATE*)calloc(1, sizeof(struct MBUS_DECODE_STATE));
       if (mp->mbus_state) {
         mp->mbus_state->frame_state = MBUS_FS_IDLE;
-        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d init, sbsiz=%d, max_records=%d, state_size=%d"),
-          meters + 1, mp->sbsiz, MBUS_MAX_RECORDS, sizeof(struct MBUS_DECODE_STATE));
+        mp->mbus_state->proto_state = MBUS_PS_IDLE;
+        mp->mbus_state->poll_countdown = MBUS_BOOT_DELAY_TICKS;
+        // parse address from txmem (hex byte, e.g. "FE")
+        if (mp->txmem && mp->txmem[0] && mp->txmem[1]) {
+          mp->mbus_state->addr = (sml_hexnibble(mp->txmem[0]) << 4) | sml_hexnibble(mp->txmem[1]);
+        } else {
+          mp->mbus_state->addr = MBUS_DEFAULT_ADDR;
+        }
+        // reject reserved/unusable M-Bus primary addresses (EN 13757-3)
+        uint8_t addr = mp->mbus_state->addr;
+        if (addr == 0x00) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d addr 0x00 targets unconfigured slaves only"), meters + 1);
+        } else if (addr >= 0xFB && addr != MBUS_DEFAULT_ADDR) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d addr 0x%02X not usable, using 0xFE"), meters + 1, addr);
+          mp->mbus_state->addr = MBUS_DEFAULT_ADDR;
+        }
+#ifdef ESP32
+        mp->meter_ss->end();
+#ifdef USE_ESP32_SW_SERIAL
+        // the initial setRxBufferSize() ran while the UART was live and was
+        // rejected by the core; re-apply now that end() stopped the driver
+        mp->meter_ss->setRxBufferSize(mp->sibsiz);
+#endif
+        if (!mp->meter_ss->setTxBufferSize(MBUS_TX_BUF_SIZE)) {
+          // no TX ring (e.g. SW-serial source): wakeup write will block or go nowhere
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d no TX buffer, wakeup may block"), meters + 1);
+        }
+        mbus_switch_serial(meters, SERIAL_8E1);
+#endif
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d init, addr=0x%02X, poll=%ds"),
+          meters + 1, mp->mbus_state->addr, mp->tsecs / 10);
       } else {
         AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d alloc failed!"), meters + 1);
       }
@@ -6136,6 +6324,114 @@ char *SML_Get_Sequence(char *cp,uint32_t index) {
   return cp;
 }
 
+#ifdef USE_SML_MBUS
+// M-Bus protocol state machine, called every 100ms per meter
+void mbus_poll_cycle(uint32_t meter) {
+  struct METER_DESC *mp = &meter_desc[meter];
+  struct MBUS_DECODE_STATE *ms = mp->mbus_state;
+  if (!ms) return;
+  if (!mp->meter_ss) return;
+
+  switch (ms->proto_state) {
+    case MBUS_PS_IDLE:
+      if (ms->poll_countdown > 0) {
+        ms->poll_countdown--;
+        return;
+      }
+      ms->proto_state = MBUS_PS_WAKEUP;
+      ms->proto_tick = 0;
+      break;
+
+    case MBUS_PS_WAKEUP:
+      mbus_switch_serial(meter, SERIAL_8N1);
+      mbus_send_wakeup(meter);
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: m%d wakeup sent"), meter + 1);
+      ms->proto_state = MBUS_PS_WAIT_WAKE;
+      ms->proto_tick = 0;
+      break;
+
+    case MBUS_PS_WAIT_WAKE:
+      ms->proto_tick++;
+      if (ms->proto_tick >= MBUS_WAIT_WAKE_TICKS) {
+#ifdef ESP32
+        // the queued wakeup has drained by now (ticks cover wire time),
+        // release the TX-enable pin held since mbus_send_wakeup()
+        if (mp->trx_en.trxen) {
+          digitalWrite(mp->trx_en.trxenpin, mp->trx_en.trxenpol);
+        }
+#endif
+        // drain any RX bytes accumulated during wakeup
+        while (mp->meter_ss->available()) {
+          mp->meter_ss->read();
+        }
+        ms->proto_state = MBUS_PS_NKE;
+      }
+      break;
+
+    case MBUS_PS_NKE:
+      // switch to 8E1 for M-Bus communication
+      mbus_switch_serial(meter, SERIAL_8E1);
+      ms->got_ack = 0;
+      ms->proto_state = MBUS_PS_WAIT_ACK;
+      ms->proto_tick = 0;
+      // send SND_NKE
+      mbus_send_short_frame(meter, MBUS_C_SND_NKE, ms->addr);
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: m%d SND_NKE sent (addr=0x%02X)"), meter + 1, ms->addr);
+      break;
+
+    case MBUS_PS_WAIT_ACK:
+      ms->proto_tick++;
+      if (ms->got_ack) {
+        ms->proto_state = MBUS_PS_REQUEST;
+        ms->retry_count = 0;
+        break;
+      }
+      if (ms->proto_tick >= MBUS_WAIT_ACK_TICKS) {
+        ms->retry_count++;
+        if (ms->retry_count >= MBUS_MAX_NKE_RETRY) {
+          AddLog(LOG_LEVEL_INFO, PSTR("MBS: m%d NKE no ACK after %d retries"), meter + 1, MBUS_MAX_NKE_RETRY);
+          ms->frame_state = MBUS_FS_IDLE;
+          mp->spos = 0;
+          ms->proto_state = MBUS_PS_IDLE;
+          ms->poll_countdown = mp->tsecs;
+          ms->retry_count = 0;
+        } else {
+          AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: m%d NKE retry %d, repeat wakeup"), meter + 1, ms->retry_count);
+          ms->proto_state = MBUS_PS_WAKEUP;
+          ms->proto_tick = 0;
+        }
+      }
+      break;
+
+    case MBUS_PS_REQUEST:
+      // send REQ_UD2
+      mbus_send_short_frame(meter, MBUS_C_REQ_UD2, ms->addr);
+      ms->frame_done = 0;
+      ms->proto_state = MBUS_PS_READING;
+      ms->proto_tick = 0;
+      AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: m%d REQ_UD2 sent"), meter + 1);
+      break;
+
+    case MBUS_PS_READING:
+      ms->proto_tick++;
+      if (ms->frame_done) {
+        AddLog(LOG_LEVEL_DEBUG, PSTR("MBS: m%d cycle done"), meter + 1);
+        ms->proto_state = MBUS_PS_IDLE;
+        ms->poll_countdown = mp->tsecs;
+        break;
+      }
+      if (ms->proto_tick >= MBUS_READ_TIMEOUT_TICKS) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: m%d read timeout"), meter + 1);
+        ms->frame_state = MBUS_FS_IDLE;
+        mp->spos = 0;
+        ms->proto_state = MBUS_PS_IDLE;
+        ms->poll_countdown = mp->tsecs;
+      }
+      break;
+  }
+}
+#endif  // USE_SML_MBUS
+
 void SML_Check_Send(void) {
   sml_globs.sml_100ms_cnt++;
 #ifdef USE_BAT_CTRL
@@ -6145,8 +6441,34 @@ void SML_Check_Send(void) {
     return;
   }
 #endif // USE_BAT_CTRL
+
+#ifdef USE_SML_MBUS
+  // drive M-Bus protocol state machines
+  for (uint32_t cnt = 0; cnt < sml_globs.meters_used; cnt++) {
+    if (meter_desc[cnt].type == 'b' && meter_desc[cnt].mbus_state
+        && meter_desc[cnt].tsecs > 0) {
+      mbus_poll_cycle(cnt);
+    }
+  }
+#endif
+
   char *cp;
   for (uint32_t cnt = sml_globs.sml_desc_cnt; cnt < sml_globs.meters_used; cnt++) {
+#ifdef USE_SML_MBUS
+    // the M-Bus state machine owns TX for type 'b' meters (passive mode sends nothing),
+    // advance round robin so other meters keep their turn
+    if (meter_desc[cnt].type == 'b') {
+      // only advance when it is actually this meter's turn, else a due
+      // sender at a lower index gets skipped over and may never send
+      if (sml_globs.sml_desc_cnt == cnt) {
+        sml_globs.sml_desc_cnt++;
+        if (sml_globs.sml_desc_cnt >= sml_globs.meters_used) {
+          sml_globs.sml_desc_cnt = 0;
+        }
+      }
+      continue;
+    }
+#endif
     if (meter_desc[cnt].trxpin >= 0 && (meter_desc[cnt].txmem || meter_desc[cnt].script_str)) {
       //AddLog(LOG_LEVEL_INFO, PSTR("100 ms>> %d - %s - %d"),sml_globs.sml_desc_cnt,meter_desc[cnt].txmem,meter_desc[cnt].tsecs);
       if ((sml_globs.sml_100ms_cnt >= meter_desc[cnt].tsecs)) {

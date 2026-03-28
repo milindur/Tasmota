@@ -5647,6 +5647,22 @@ next_line:
         mp->use_crypt = false;
       }
 #endif  // USE_SML_DECRYPT
+      if (mp->srcpin == TCP_MODE_FLG) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d M-Bus requires a local UART, TCP source not supported"), meters + 1);
+        continue;
+      }
+#ifdef ESP8266
+      if (mp->meter_ss && !mp->meter_ss->hardwareSerial()) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d M-Bus requires hardware serial on ESP8266"), meters + 1);
+        continue;
+      }
+#endif  // ESP8266
+#if defined(ESP32) && defined(USE_ESP32_SW_SERIAL)
+      if (mp->srcpin < 0) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MBS: meter %d M-Bus requires hardware serial, software serial has no TX"), meters + 1);
+        continue;
+      }
+#endif  // ESP32 && USE_ESP32_SW_SERIAL
       mp->mbus_state = (struct MBUS_DECODE_STATE*)calloc(1, sizeof(struct MBUS_DECODE_STATE));
       if (mp->mbus_state) {
         mp->mbus_state->frame_state = MBUS_FS_IDLE;
